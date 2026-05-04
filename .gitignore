@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+.venv/
+venv/
+*.csv        # if you generate output data files you don't want versioned
+*.npy
+*.npz
