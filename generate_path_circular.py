@@ -38,11 +38,22 @@ from mpl_toolkits.mplot3d import Axes3D
 
 N_LAPS           = 2    # circular laps to repeat
 N_ENTRY_SEGMENTS = 1    # entry segments (played once, not repeated)
-ORDER            = 11   # polynomial degree per segment
+ORDER            = 13   # polynomial degree per segment.
+                        # C4 junction continuity uses 5 constraints/axis/junction.
+                        # Middle circular segments: 5(start)+5(end)+2(obs)=12 constraints/axis.
+                        # ORDER=13 → 14 coefficients/axis → 2 DOF/axis for snap minimisation.
 N_INT            = 80   # snap-cost integration samples per segment
 M_SAMP           = 60   # a_z inequality samples per segment
+B_SAMP           = 40   # box constraint samples per segment (fewer is fine, these are smooth)
 MARGIN           = 1e-3
 GRAV             = 9.81
+
+# ── Workspace box constraints (sampled along each segment) ────────────────────
+# NED frame: x = North, y = East, z = Down (negative = up)
+# z < Z_CEIL  enforces a minimum altitude (e.g. -0.5 → at least 0.5 m above ground)
+X_MIN, X_MAX = -3.0,  3.0
+Y_MIN, Y_MAX = -2.0,  2.0
+Z_CEIL       = -0.5   # drone must stay at z < -0.5 (above 0.5 m floor)
 
 RHO_X, RHO_Y, RHO_Z = 0.0, 0.0, 0.0
 
@@ -74,7 +85,7 @@ SEGMENTS = [
     },
     # ── Circular segment 1 ───────────────────────────────────────────────────
     {
-        'duration' : 3.5,
+        'duration' : 3.0,
         'obstacle' : {
             'pos'       : (0.0, 1.0, -1.5),
             'phi_deg'   : 20.0,
@@ -102,7 +113,7 @@ SEGMENTS = [
     },
     # ── Circular segment 3 ───────────────────────────────────────────────────
     {
-        'duration' : 3.5,
+        'duration' : 3.0,
         'obstacle' : {
             'pos'       : (0.0, -1.0, -1.5),
             'phi_deg'   : 20.0,
@@ -165,6 +176,9 @@ def acc_basis(t, n):
 def jerk_basis(t, n):
     return np.array([0.0 if i <= 2 else i*(i-1)*(i-2)*t**(i-3) for i in range(n)], dtype=float)
 
+def snap_basis(t, n):
+    return np.array([0.0 if i <= 3 else i*(i-1)*(i-2)*(i-3)*t**(i-4) for i in range(n)], dtype=float)
+
 def eval_poly(c, t):
     return sum(c[i]*t**i for i in range(len(c)))
 
@@ -173,6 +187,12 @@ def eval_vel(c, t):
 
 def eval_acc(c, t):
     return sum(i*(i-1)*c[i]*t**(i-2) for i in range(2, len(c)))
+
+def eval_jerk(c, t):
+    return sum(i*(i-1)*(i-2)*c[i]*t**(i-3) for i in range(3, len(c)))
+
+def eval_snap(c, t):
+    return sum(i*(i-1)*(i-2)*(i-3)*c[i]*t**(i-4) for i in range(4, len(c)))
 
 def fit_initial_coeffs(constraints, n):
     bases = {'pos': time_power_vec, 'vel': vel_basis, 'acc': acc_basis}
@@ -226,26 +246,30 @@ def eq(expr, val):
 def ineq_upper(expr, ub):
     g_cons.append(expr); lbg.append(-ca.inf); ubg.append(float(ub))
 
+def ineq_range(expr, lb, ub):
+    """lb <= expr <= ub"""
+    g_cons.append(expr); lbg.append(float(lb)); ubg.append(float(ub))
+
 hx, hy, hz = HOVER_START
 
-# ── Hover start: fix position of entry segment at t=0 ────────────────────────
-# Velocity and acceleration are NOT fixed — the controller converges from hover.
+# ── Hover start: fix position, velocity, acceleration and jerk at t=0 ─────────
+# Snap is left free — fixing 4 derivatives per axis uses 12 of 14 coefficients,
+# leaving 2 DOF per axis for the snap-minimising optimiser.
 for c_vec, val in zip([cx_vars[0], cy_vars[0], cz_vars[0]], [hx, hy, hz]):
-    eq(ca.dot(c_vec, ca.DM(time_power_vec(0.0, n))), val)
+    eq(ca.dot(c_vec, ca.DM(time_power_vec(0.0, n))), val)  # position
+    eq(ca.dot(c_vec, ca.DM(vel_basis(0.0,        n))), 0.0)  # velocity  = 0
+    eq(ca.dot(c_vec, ca.DM(acc_basis(0.0,        n))), 0.0)  # acceleration = 0
+    eq(ca.dot(c_vec, ca.DM(jerk_basis(0.0,       n))), 0.0)  # jerk = 0
 
-# ── Circular lap wrap: C2 continuity (pos + vel + acc) ───────────────────────
+# ── Circular lap wrap: C4 continuity (pos + vel + acc + jerk + snap) ─────────
 # End of last circular segment must match start of first circular segment.
-# This is what makes laps seamless.
 tf_last   = float(SEGMENTS[-1]['duration'])
-first_c   = N_ENTRY_SEGMENTS   # index of first circular segment
+first_c   = N_ENTRY_SEGMENTS
 for c_last, c_first in zip([cx_vars[-1], cy_vars[-1], cz_vars[-1]],
                              [cx_vars[first_c], cy_vars[first_c], cz_vars[first_c]]):
-    eq(ca.dot(c_last,  ca.DM(time_power_vec(tf_last, n))) -
-       ca.dot(c_first, ca.DM(time_power_vec(0.0,    n))), 0.0)   # pos
-    eq(ca.dot(c_last,  ca.DM(vel_basis(tf_last, n))) -
-       ca.dot(c_first, ca.DM(vel_basis(0.0,    n))), 0.0)         # vel
-    eq(ca.dot(c_last,  ca.DM(acc_basis(tf_last, n))) -
-       ca.dot(c_first, ca.DM(acc_basis(0.0,    n))), 0.0)         # acc
+    for basis in [time_power_vec, vel_basis, acc_basis, jerk_basis, snap_basis]:
+        eq(ca.dot(c_last,  ca.DM(basis(tf_last, n))) -
+           ca.dot(c_first, ca.DM(basis(0.0,    n))), 0.0)
 
 # ── Per-segment constraints ───────────────────────────────────────────────────
 for i, seg in enumerate(SEGMENTS):
@@ -275,16 +299,13 @@ for i, seg in enumerate(SEGMENTS):
         ti = k * dt_int
         total_cost += ca.substitute(snap_x**2 + snap_y**2 + snap_z**2, t_sym, ti) * dt_int
 
-    # C2 continuity to next segment (covers entry→circ1 and all circ junctions)
+    # C4 continuity to next segment (pos, vel, acc, jerk, snap)
     if i < S - 1:
         cx_n = cx_vars[i+1]; cy_n = cy_vars[i+1]; cz_n = cz_vars[i+1]
         for c_cur, c_nxt in zip([cx, cy, cz], [cx_n, cy_n, cz_n]):
-            eq(ca.dot(c_cur, ca.DM(time_power_vec(tf,  n))) -
-               ca.dot(c_nxt, ca.DM(time_power_vec(0.0, n))), 0.0)
-            eq(ca.dot(c_cur, ca.DM(vel_basis(tf,  n))) -
-               ca.dot(c_nxt, ca.DM(vel_basis(0.0, n))), 0.0)
-            eq(ca.dot(c_cur, ca.DM(acc_basis(tf,  n))) -
-               ca.dot(c_nxt, ca.DM(acc_basis(0.0, n))), 0.0)
+            for basis in [time_power_vec, vel_basis, acc_basis, jerk_basis, snap_basis]:
+                eq(ca.dot(c_cur, ca.DM(basis(tf,  n))) -
+                   ca.dot(c_nxt, ca.DM(basis(0.0, n))), 0.0)
 
     # Obstacle: position at t_mid
     eq(ca.dot(cx, ca.DM(time_power_vec(t_mid, n))), xm)
@@ -344,6 +365,18 @@ for i, seg in enumerate(SEGMENTS):
     for k in range(M_SAMP):
         ti = (k / float(max(1, M_SAMP - 1))) * tf
         ineq_upper(ca.dot(cz, ca.DM(acc_basis(ti, n))), GRAV - MARGIN)
+
+    # ── Workspace box constraints ─────────────────────────────────────────────
+    # Sampled at B_SAMP points including endpoints.
+    # x ∈ [X_MIN, X_MAX],  y ∈ [Y_MIN, Y_MAX],  z < Z_CEIL (NED, so z is negative)
+    for k in range(B_SAMP):
+        ti = (k / float(max(1, B_SAMP - 1))) * tf
+        xi = ca.dot(cx, ca.DM(time_power_vec(ti, n)))
+        yi = ca.dot(cy, ca.DM(time_power_vec(ti, n)))
+        zi = ca.dot(cz, ca.DM(time_power_vec(ti, n)))
+        ineq_range(xi, X_MIN, X_MAX)
+        ineq_range(yi, Y_MIN, Y_MAX)
+        ineq_upper(zi, Z_CEIL)
 
 # ============================================================
 #  INITIAL GUESS
@@ -423,17 +456,20 @@ for i in range(S):
     solved.append({'cx': cx_sol.tolist(), 'cy': cy_sol.tolist(), 'cz': cz_sol.tolist(),
                    'tf': tf, 't_mid': tf/2.0})
 
-# Verify circular lap wrap continuity
-print("\n── Lap-wrap continuity check ────────────────────────────────────────")
+# Verify circular lap wrap C4 continuity
+print("\n── Lap-wrap continuity check (C4) ──────────────────────────────────")
 last = solved[-1]; first_c_sol = solved[N_ENTRY_SEGMENTS]
 tf_l = last['tf']
 for axis, cl, cf in zip(['x','y','z'],
-                         [last['cx'],       last['cy'],       last['cz']],
+                         [last['cx'],        last['cy'],        last['cz']],
                          [first_c_sol['cx'], first_c_sol['cy'], first_c_sol['cz']]):
-    dp = eval_poly(cl, tf_l) - eval_poly(cf, 0.)
-    dv = eval_vel(cl,  tf_l) - eval_vel(cf,  0.)
-    da = eval_acc(cl,  tf_l) - eval_acc(cf,  0.)
-    print(f"  {axis}: Δpos={dp:.2e}  Δvel={dv:.2e}  Δacc={da:.2e}")
+    dp  = eval_poly(cl, tf_l) - eval_poly(cf, 0.)
+    dv  = eval_vel(cl,  tf_l) - eval_vel(cf,  0.)
+    da  = eval_acc(cl,  tf_l) - eval_acc(cf,  0.)
+    dj  = eval_jerk(cl, tf_l) - eval_jerk(cf, 0.)
+    ds  = eval_snap(cl, tf_l) - eval_snap(cf, 0.)
+    print(f"  {axis}: Δpos={dp:.2e}  Δvel={dv:.2e}  Δacc={da:.2e}  "
+          f"Δjerk={dj:.2e}  Δsnap={ds:.2e}")
 
 # ============================================================
 #  YAML OUTPUTS
@@ -577,6 +613,12 @@ for key, lbl, c in zip(['x','y','z'], ['x','y','z'], ['tab:blue','tab:orange','t
     axs_p[2].plot(ts_cat, np.concatenate(all_acl[key]), color=c, label=lbl)
 
 axs_p[2].axhline(GRAV - MARGIN, color='r', linestyle='--', linewidth=0.8, label='a_z limit')
+
+# Show workspace box limits on the position plot
+for val, lbl, col in [(X_MIN,'x_min','tab:blue'), (X_MAX,'x_max','tab:blue'),
+                       (Y_MIN,'y_min','tab:orange'), (Y_MAX,'y_max','tab:orange'),
+                       (Z_CEIL,'z_ceil','tab:green')]:
+    axs_p[0].axhline(val, color=col, linestyle=':', linewidth=0.8, alpha=0.6, label=lbl)
 
 t_b = 0.0
 for i, res in enumerate(solved):
